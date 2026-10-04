@@ -2,15 +2,18 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   Play, Plus, Search, Bell, X, Pause, ChevronLeft,
   Volume2, VolumeX, Volume1, Maximize, Minimize,
-  RotateCcw, RotateCw, Loader2,
+  RotateCcw, RotateCw, Loader2, Users, Link, LogOut,
+  MessageCircle, Send,
 } from "lucide-react";
 
 // ============================================================================
 // MarsFlix — talks to the FastAPI backend, which signs B2 URLs on demand.
 // Set VITE_API_URL in .env.local (no trailing slash).
+// Watch parties use the relay in server/sync-server.js — set VITE_SYNC_URL.
 // ============================================================================
 
 const API = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+const SYNC = (import.meta.env.VITE_SYNC_URL || "ws://localhost:8787").replace(/\/+$/, "");
 
 const FALLBACK_IMG =
   "https://images.unsplash.com/photo-1614728263952-84ea256f9679?w=800&q=80";
@@ -26,6 +29,103 @@ const fmt = (s) => {
     ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
     : `${m}:${String(sec).padStart(2, "0")}`;
 };
+
+/* --- watch party ---------------------------------------------------
+   Everyone in a room sends {t:"sync", ref, time, playing, hard} when
+   they play, pause, seek or change title. `ref` names the title (each
+   client fetches its own signed URL). Whoever acted last is the leader
+   and sends a soft sync every few seconds to correct drift.
+   ------------------------------------------------------------------ */
+
+const CLIENT_ID = Math.random().toString(36).slice(2, 10);
+const HEARTBEAT_MS = 4000;
+const CHAT_MAX = 100; // messages kept on screen; nothing is stored anywhere
+
+const loadName = () => {
+  try { return localStorage.getItem("mf-name") || ""; } catch { return ""; }
+};
+const saveName = (n) => {
+  try { localStorage.setItem("mf-name", n); } catch { /* private mode */ }
+};
+const HARD_DRIFT = 0.5; // seconds
+const SOFT_DRIFT = 2;
+
+const sameRef = (a, b) =>
+  !!a && !!b && a.type === b.type && a.id === b.id &&
+  String(a.season) === String(b.season) && a.ep === b.ep;
+
+const refKey = (r) => `${r.type}:${r.id}:${r.season ?? ""}:${r.ep ?? ""}`;
+
+const inviteLink = (room) => {
+  const u = new URL(window.location.href);
+  u.search = "";
+  u.hash = "";
+  u.searchParams.set("room", room);
+  return u.toString();
+};
+
+function useWatchParty(handlerRef) {
+  const [room, setRoom] = useState(() => new URLSearchParams(window.location.search).get("room"));
+  const [peers, setPeers] = useState(0);
+  const [connected, setConnected] = useState(false);
+  const wsRef = useRef(null);
+
+  useEffect(() => {
+    if (!room) return;
+    let ws, retry, closed = false;
+    const connect = () => {
+      ws = new WebSocket(`${SYNC}/room/${encodeURIComponent(room)}`);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setConnected(true);
+        ws.send(JSON.stringify({ t: "hello", from: CLIENT_ID }));
+      };
+      ws.onmessage = (e) => {
+        let m;
+        try { m = JSON.parse(e.data); } catch { return; }
+        if (m.t === "peers") setPeers(m.count);
+        else if (m.from !== CLIENT_ID) handlerRef.current?.(m);
+      };
+      ws.onclose = () => {
+        setConnected(false);
+        if (!closed) retry = setTimeout(connect, 2000);
+      };
+    };
+    connect();
+    return () => {
+      closed = true;
+      clearTimeout(retry);
+      ws.close();
+      wsRef.current = null;
+    };
+  }, [room, handlerRef]);
+
+  const send = useCallback((m) => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ...m, from: CLIENT_ID }));
+  }, []);
+
+  const setUrlRoom = (id) => {
+    const u = new URL(window.location.href);
+    if (id) u.searchParams.set("room", id); else u.searchParams.delete("room");
+    window.history.replaceState(null, "", u);
+  };
+
+  const create = useCallback(() => {
+    const id = Math.random().toString(36).slice(2, 8);
+    setUrlRoom(id);
+    setRoom(id);
+    return id;
+  }, []);
+
+  const leave = useCallback(() => {
+    setUrlRoom(null);
+    setRoom(null);
+    setPeers(0);
+  }, []);
+
+  return { room, peers, connected, send, create, leave };
+}
 
 export default function MarsFlix() {
   const [catalogue, setCatalogue] = useState([]);
@@ -55,45 +155,129 @@ export default function MarsFlix() {
     return () => { cancelled = true; };
   }, []);
 
-  const playFilm = useCallback(async (item) => {
-    try {
-      const r = await fetch(`${API}/api/stream/${item.id}`);
-      if (!r.ok) throw new Error(`Couldn't load ${item.title}`);
-      const { url, title } = await r.json();
-      setNowPlaying({ url, title });
-    } catch (e) {
-      setError(e.message);
-    }
+  const playerApi = useRef(null);   // { getState, apply } from the mounted Player
+  const pendingSync = useRef(null); // remote sync waiting for its title to load
+  const leader = useRef(null);
+  const loadingKey = useRef(null);
+
+  const partyHandler = useRef(null);
+  const party = useWatchParty(partyHandler);
+  const { send: partySend } = party;
+
+  const [chat, setChat] = useState([]); // {id, from, name, text, mine} — not persisted
+  const [name, setName] = useState(loadName);
+
+  const setMyName = useCallback((n) => {
+    setName(n);
+    saveName(n);
   }, []);
 
-  const playEpisode = useCallback(async (show, season, ep) => {
+  const pushChat = useCallback((msg) => {
+    setChat((c) => [...c, msg].slice(-CHAT_MAX));
+  }, []);
+
+  const sendChat = useCallback((text) => {
+    const trimmed = text.trim().slice(0, 500);
+    if (!trimmed) return;
+    const id = `${CLIENT_ID}-${Date.now()}`;
+    pushChat({ id, from: CLIENT_ID, name: name || "You", text: trimmed, mine: true });
+    partySend({ t: "chat", id, name: name || "Guest", text: trimmed });
+  }, [name, partySend, pushChat]);
+
+  const broadcast = useCallback((state) => {
+    leader.current = CLIENT_ID;
+    partySend({ t: "sync", ...state, hard: true });
+  }, [partySend]);
+
+  // ref: { type: "film", id } | { type: "episode", id, season, ep }
+  const play = useCallback(async (ref, { label, share = false } = {}) => {
+    const key = refKey(ref);
+    loadingKey.current = key;
     try {
-      const r = await fetch(`${API}/api/stream/${show.id}/${season}/${ep}`);
-      if (!r.ok) throw new Error(`Couldn't load episode ${ep}`);
+      const path = ref.type === "episode" ? `${ref.id}/${ref.season}/${ref.ep}` : ref.id;
+      const r = await fetch(`${API}/api/stream/${path}`);
+      if (!r.ok) throw new Error(`Couldn't load ${label || (ref.type === "episode" ? `episode ${ref.ep}` : "that title")}`);
       const { url, title } = await r.json();
 
-      const eps = show.seasons[season];
-      const idx = eps.findIndex((e) => e.ep === ep);
-      const next = idx >= 0 && idx < eps.length - 1
-        ? { show, season, ep: eps[idx + 1].ep }
-        : null;
+      let next = null;
+      if (ref.type === "episode") {
+        const eps = catalogue.find((c) => c.id === ref.id)?.seasons?.[ref.season] || [];
+        const idx = eps.findIndex((e) => e.ep === ref.ep);
+        if (idx >= 0 && idx < eps.length - 1) next = { ...ref, ep: eps[idx + 1].ep };
+      }
 
-      setNowPlaying({ url, title, next });
+      setNowPlaying({ url, title, ref, next });
       setOpenSeries(null);
+      if (share) broadcast({ ref, time: 0, playing: true });
     } catch (e) {
       setError(e.message);
+    } finally {
+      if (loadingKey.current === key) loadingKey.current = null;
     }
-  }, []);
+  }, [catalogue, broadcast]);
+
+  const playFilm = (item) => play({ type: "film", id: item.id }, { label: item.title, share: true });
+
+  const playEpisode = (show, season, ep) =>
+    play({ type: "episode", id: show.id, season, ep }, { share: true });
 
   const openTile = (item) =>
     item.type === "series" ? setOpenSeries(item) : playFilm(item);
 
-  const playNext = () => {
-    if (nowPlaying?.next) {
-      const { show, season, ep } = nowPlaying.next;
-      playEpisode(show, season, ep);
-    }
+  // auto = reached the end on its own; everyone gets there, so don't broadcast
+  const playNext = ({ auto = false } = {}) => {
+    if (nowPlaying?.next) play(nowPlaying.next, { share: !auto });
   };
+
+  useEffect(() => {
+    partyHandler.current = (m) => {
+      if (m.t === "hello") {
+        const s = playerApi.current?.getState();
+        if (s) partySend({ t: "sync", ...s, hard: true, reply: true });
+        return;
+      }
+      if (m.t === "chat") {
+        pushChat({ id: m.id || `${m.from}-${Date.now()}`, from: m.from, name: m.name || "Guest", text: String(m.text || "").slice(0, 500), mine: false });
+        return;
+      }
+      if (m.t !== "sync" || !m.ref) return;
+      m.at = performance.now();
+      if (m.hard && !m.reply) leader.current = m.from;
+      if (sameRef(m.ref, nowPlaying?.ref) && playerApi.current) {
+        playerApi.current.apply(m);
+      } else if (m.hard) {
+        // Only deliberate actions switch titles; heartbeats just correct drift,
+        // so closing the player to browse doesn't get it reopened.
+        pendingSync.current = m;
+        if (loadingKey.current !== refKey(m.ref)) play(m.ref);
+      }
+    };
+  });
+
+  // A fresh room starts with a clean, empty chat.
+  const startParty = () => {
+    setChat([]);
+    party.create();
+    leader.current = CLIENT_ID;
+  };
+
+  const leaveParty = () => {
+    party.leave();
+    setChat([]);
+  };
+
+  // Leader heartbeat keeps everyone within SOFT_DRIFT of each other.
+  useEffect(() => {
+    if (!party.room) return;
+    const id = setInterval(() => {
+      if (leader.current !== CLIENT_ID) return;
+      const s = playerApi.current?.getState();
+      if (s) partySend({ t: "sync", ...s, hard: false });
+    }, HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [party.room, partySend]);
+
+  const partyUi = { ...party, start: startParty, leave: leaveParty, chat, sendChat, name, setName: setMyName };
 
   const featured = catalogue[0];
 
@@ -125,7 +309,7 @@ export default function MarsFlix() {
         @media (prefers-reduced-motion: reduce){ .mf-card, .mf-btn, .mf-skel, .mf-spin { transition: none; animation: none; } }
       `}</style>
 
-      <Nav />
+      <Nav party={partyUi} />
 
       {loading && <SkeletonHome />}
 
@@ -172,6 +356,10 @@ export default function MarsFlix() {
           item={nowPlaying}
           onNext={nowPlaying.next ? playNext : null}
           onClose={() => setNowPlaying(null)}
+          party={partyUi}
+          apiRef={playerApi}
+          pendingSyncRef={pendingSync}
+          onSync={broadcast}
         />
       )}
     </div>
@@ -190,7 +378,7 @@ function useIsMobile(bp = 700) {
   return m;
 }
 
-function Nav() {
+function Nav({ party }) {
   const [scrolled, setScrolled] = useState(false);
   const isMobile = useIsMobile();
 
@@ -223,6 +411,7 @@ function Nav() {
       )}
 
       <div style={{ marginLeft: "auto", display: "flex", gap: isMobile ? 16 : 18, alignItems: "center", flexShrink: 0 }}>
+        {party.room && <PartyControl party={party} compact={isMobile} />}
         <Search size={20} color="#cbbfb6" />
         {!isMobile && <Bell size={20} color="#cbbfb6" />}
         <div style={{ width: 30, height: 30, borderRadius: 6, background: "linear-gradient(135deg,#e0532f,#7a2418)", flexShrink: 0 }} />
@@ -392,7 +581,176 @@ function SeriesView({ show, onPick, onClose }) {
 
 /* ------------------------------------------------------------------ */
 
-function Player({ item, onClose, onNext }) {
+function PartyControl({ party, compact }) {
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+
+  const say = (msg) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2200);
+  };
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
+
+  const copy = async (room) => {
+    const link = inviteLink(room);
+    try {
+      await navigator.clipboard.writeText(link);
+      say("Invite link copied — send it to your friend");
+    } catch {
+      window.prompt("Copy this invite link:", link);
+    }
+  };
+
+  const pill = {
+    display: "flex", alignItems: "center", gap: 6, height: 36,
+    background: "rgba(120,110,102,.35)", color: "#f5efe9", border: "none",
+    borderRadius: 18, fontSize: 13, fontWeight: 600, whiteSpace: "nowrap",
+  };
+  const mini = { background: "none", border: "none", color: "#f5efe9", display: "flex", padding: 6 };
+
+  return (
+    <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+      {!party.room ? (
+        <button className="mf-btn" onClick={() => copy(party.start())} style={{ ...pill, padding: "0 14px" }}
+          aria-label="Watch together">
+          <Users size={17} /> {!compact && "Watch together"}
+        </button>
+      ) : (
+        <div style={{ ...pill, padding: "0 4px 0 12px" }}>
+          <span title={party.connected ? "Connected" : "Reconnecting…"}
+            style={{ width: 8, height: 8, borderRadius: "50%", background: party.connected ? "#4ade80" : "#f5a524" }} />
+          <Users size={15} />
+          <span style={{ fontVariantNumeric: "tabular-nums" }}>
+            {party.connected ? party.peers : "…"}{!compact && (party.peers === 1 ? " watching" : " watching")}
+          </span>
+          <button className="mf-btn" onClick={() => copy(party.room)} aria-label="Copy invite link" title="Copy invite link" style={mini}>
+            <Link size={16} />
+          </button>
+          <button className="mf-btn" onClick={party.leave} aria-label="Leave watch party" title="Leave watch party" style={mini}>
+            <LogOut size={16} />
+          </button>
+        </div>
+      )}
+      {toast && (
+        <div role="status" style={{
+          position: "absolute", top: "calc(100% + 8px)", right: 0, zIndex: 10,
+          background: "rgba(10,6,5,.92)", color: "#f5efe9", fontSize: 13,
+          padding: "8px 12px", borderRadius: 6, whiteSpace: "nowrap",
+          boxShadow: "0 6px 20px rgba(0,0,0,.5)",
+        }}>
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChatPanel({ party, isMobile, onClose }) {
+  const [draft, setDraft] = useState("");
+  const [editingName, setEditingName] = useState(!party.name);
+  const listRef = useRef(null);
+  const inputRef = useRef(null);
+  const chat = party.chat || [];
+
+  // Keep the newest message in view.
+  useEffect(() => {
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [chat.length]);
+
+  useEffect(() => { if (!editingName) inputRef.current?.focus(); }, [editingName]);
+
+  const submit = (e) => {
+    e.preventDefault();
+    party.sendChat(draft);
+    setDraft("");
+  };
+
+  const field = {
+    width: "100%", background: "rgba(255,255,255,.08)", border: "1px solid rgba(255,255,255,.15)",
+    borderRadius: 8, color: "#f5efe9", fontSize: 14, padding: "10px 12px", outline: "none",
+    fontFamily: "'Inter', system-ui, sans-serif",
+  };
+
+  return (
+    <div style={{
+      position: "absolute", zIndex: 4,
+      top: isMobile ? "auto" : 0, bottom: 0, right: 0,
+      left: isMobile ? 0 : "auto",
+      width: isMobile ? "100%" : 340,
+      height: isMobile ? "55%" : "100%",
+      display: "flex", flexDirection: "column",
+      background: "rgba(10,6,5,.92)", backdropFilter: "blur(10px)",
+      borderLeft: isMobile ? "none" : "1px solid rgba(255,255,255,.1)",
+      borderTop: isMobile ? "1px solid rgba(255,255,255,.1)" : "none",
+    }}>
+      {/* header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 16px", borderBottom: "1px solid rgba(255,255,255,.08)" }}>
+        <MessageCircle size={18} color="#e0532f" />
+        <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: 15 }}>Chat</span>
+        {party.name && !editingName && (
+          <button className="mf-btn" onClick={() => setEditingName(true)}
+            style={{ background: "none", border: "none", color: "#9a8d84", fontSize: 12, cursor: "pointer", padding: 0 }}>
+            you’re <span style={{ color: "#cbbfb6", fontWeight: 600 }}>{party.name}</span> · edit
+          </button>
+        )}
+        <button className="mf-btn" onClick={onClose} aria-label="Close chat"
+          style={{ marginLeft: "auto", background: "none", border: "none", color: "#cbbfb6", display: "flex", padding: 4 }}>
+          <X size={20} />
+        </button>
+      </div>
+
+      {editingName ? (
+        <form
+          onSubmit={(e) => { e.preventDefault(); if (draft.trim()) { party.setName(draft.trim().slice(0, 24)); setDraft(""); } setEditingName(false); }}
+          style={{ padding: 16, display: "flex", flexDirection: "column", gap: 10 }}
+        >
+          <label style={{ fontSize: 13, color: "#cbbfb6" }}>What should your friend see you as?</label>
+          <input autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
+            placeholder={party.name || "Your name"} maxLength={24} style={field} />
+          <button type="submit" className="mf-btn"
+            style={{ background: "#e0532f", color: "#fff", border: "none", borderRadius: 8, padding: "10px 0", fontWeight: 600, fontSize: 14, cursor: "pointer" }}>
+            Start chatting
+          </button>
+        </form>
+      ) : (
+        <>
+          <div ref={listRef} style={{ flex: 1, overflowY: "auto", padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+            {chat.length === 0 ? (
+              <p style={{ color: "#8a7d74", fontSize: 13, lineHeight: 1.5, margin: "auto", textAlign: "center" }}>
+                No messages yet. Say hi 👋<br />Messages aren’t saved — they vanish when you reload.
+              </p>
+            ) : chat.map((m) => (
+              <div key={m.id} style={{ alignSelf: m.mine ? "flex-end" : "flex-start", maxWidth: "85%" }}>
+                {!m.mine && <div style={{ fontSize: 11, color: "#9a8d84", marginBottom: 2, marginLeft: 4 }}>{m.name}</div>}
+                <div style={{
+                  background: m.mine ? "#e0532f" : "rgba(120,110,102,.3)",
+                  color: "#fff", padding: "8px 12px", borderRadius: 12,
+                  borderBottomRightRadius: m.mine ? 3 : 12, borderBottomLeftRadius: m.mine ? 12 : 3,
+                  fontSize: 14, lineHeight: 1.4, wordBreak: "break-word",
+                }}>
+                  {m.text}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <form onSubmit={submit} style={{ display: "flex", gap: 8, padding: "12px 16px", borderTop: "1px solid rgba(255,255,255,.08)" }}>
+            <input ref={inputRef} value={draft} onChange={(e) => setDraft(e.target.value)}
+              placeholder="Message…" maxLength={500} style={{ ...field, flex: 1 }} />
+            <button type="submit" className="mf-btn" aria-label="Send"
+              style={{ background: "#e0532f", color: "#fff", border: "none", borderRadius: 8, padding: "0 14px", display: "flex", alignItems: "center", cursor: "pointer" }}>
+              <Send size={18} />
+            </button>
+          </form>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Player({ item, onClose, onNext, party, apiRef, pendingSyncRef, onSync }) {
   const videoRef = useRef(null);
   const shellRef = useRef(null);
   const hideTimer = useRef(null);
@@ -410,6 +768,58 @@ function Player({ item, onClose, onNext }) {
   const [uiVisible, setUiVisible] = useState(true);
   const [scrubbing, setScrubbing] = useState(false);
   const [flash, setFlash] = useState(null); // 'back' | 'forward'
+  const [chatOpen, setChatOpen] = useState(false);
+
+  /* --- chat unread badge --- */
+  const chat = party.chat || [];
+  const seenCount = useRef(chat.length);
+  const [unread, setUnread] = useState(0);
+  useEffect(() => {
+    if (chatOpen) { seenCount.current = chat.length; setUnread(0); return; }
+    const missed = chat.length - seenCount.current;
+    if (missed > 0) setUnread(missed);
+  }, [chat.length, chatOpen]);
+
+  /* --- watch party sync --- */
+  const getState = useCallback(() => {
+    const v = videoRef.current;
+    if (!v || v.readyState < 1) return null;
+    return { ref: item.ref, time: v.currentTime, playing: !v.paused };
+  }, [item.ref]);
+
+  const share = useCallback(() => {
+    const s = getState();
+    if (s) onSync(s);
+  }, [getState, onSync]);
+
+  const apply = useCallback((m) => {
+    const v = videoRef.current;
+    if (!v || v.readyState < 1) { pendingSyncRef.current = m; return; }
+    const target = m.time + (m.playing ? (performance.now() - m.at) / 1000 : 0);
+    if (Math.abs(v.currentTime - target) > (m.hard ? HARD_DRIFT : SOFT_DRIFT)) {
+      v.currentTime = Math.min(target, v.duration || target);
+    }
+    if (m.playing && v.paused) {
+      // Unmuted autoplay can be blocked without a tap; fall back to muted.
+      v.play().catch(() => { v.muted = true; setMuted(true); v.play().catch(() => {}); });
+    } else if (!m.playing) {
+      v.pause(); // even if already paused: this also cancels a pending autoplay
+    }
+  }, [pendingSyncRef]);
+
+  useEffect(() => {
+    apiRef.current = { getState, apply };
+    return () => { apiRef.current = null; };
+  }, [apiRef, getState, apply]);
+
+  const onMeta = (e) => {
+    setDuration(e.target.duration || 0);
+    const m = pendingSyncRef.current;
+    if (m && sameRef(m.ref, item.ref)) {
+      pendingSyncRef.current = null;
+      apply(m);
+    }
+  };
 
   /* --- control visibility --- */
   const showUi = useCallback(() => {
@@ -431,8 +841,9 @@ function Player({ item, onClose, onNext }) {
     const v = videoRef.current;
     if (!v) return;
     if (v.paused) v.play().catch(() => {}); else v.pause();
+    share();
     showUi();
-  }, [showUi]);
+  }, [showUi, share]);
 
   const skip = useCallback((delta) => {
     const v = videoRef.current;
@@ -440,8 +851,9 @@ function Player({ item, onClose, onNext }) {
     v.currentTime = Math.min(Math.max(v.currentTime + delta, 0), v.duration);
     setFlash(delta < 0 ? "back" : "forward");
     setTimeout(() => setFlash(null), 450);
+    share();
     showUi();
-  }, [showUi]);
+  }, [showUi, share]);
 
   const setVol = useCallback((val) => {
     const v = videoRef.current;
@@ -538,6 +950,12 @@ function Player({ item, onClose, onNext }) {
     v.currentTime = t;
   };
 
+  const endScrub = () => {
+    if (!scrubbing) return;
+    setScrubbing(false);
+    share();
+  };
+
   const pct = duration ? (current / duration) * 100 : 0;
   const bufPct = duration ? (buffered / duration) * 100 : 0;
   const VolIcon = muted || volume === 0 ? VolumeX : volume < 0.5 ? Volume1 : Volume2;
@@ -574,7 +992,30 @@ function Player({ item, onClose, onNext }) {
         }}>
           {item.title}
         </span>
+        <div style={{ marginLeft: "auto", flexShrink: 0, display: "flex", alignItems: "center", gap: 8 }}>
+          {party.room && (
+            <button className="mf-btn" onClick={() => setChatOpen((o) => !o)}
+              aria-label={chatOpen ? "Hide chat" : "Show chat"}
+              style={{ ...iconBtn, position: "relative", color: chatOpen ? "#e0532f" : "#f5efe9" }}>
+              <MessageCircle size={22} />
+              {unread > 0 && !chatOpen && (
+                <span style={{
+                  position: "absolute", top: 4, right: 4, minWidth: 16, height: 16,
+                  padding: "0 4px", borderRadius: 8, background: "#e0532f", color: "#fff",
+                  fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  {unread > 9 ? "9+" : unread}
+                </span>
+              )}
+            </button>
+          )}
+          <PartyControl party={party} compact={isMobile} />
+        </div>
       </div>
+
+      {party.room && chatOpen && (
+        <ChatPanel party={party} isMobile={isMobile} onClose={() => setChatOpen(false)} />
+      )}
 
       {/* video */}
       <div style={{ flex: 1, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 0 }}>
@@ -600,10 +1041,10 @@ function Player({ item, onClose, onNext }) {
               onWaiting={() => setWaiting(true)}
               onPlaying={() => setWaiting(false)}
               onCanPlay={() => setWaiting(false)}
-              onLoadedMetadata={(e) => setDuration(e.target.duration || 0)}
+              onLoadedMetadata={onMeta}
               onDurationChange={(e) => setDuration(e.target.duration || 0)}
               onError={() => { setFailed(true); setWaiting(false); }}
-              onEnded={() => onNext && onNext()}
+              onEnded={() => onNext && onNext({ auto: true })}
               onTimeUpdate={onTime}
               onProgress={onTime}
               style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
@@ -654,11 +1095,11 @@ function Player({ item, onClose, onNext }) {
           <div
             onMouseDown={(e) => { setScrubbing(true); seekFromEvent(e); }}
             onMouseMove={(e) => scrubbing && seekFromEvent(e)}
-            onMouseUp={() => setScrubbing(false)}
-            onMouseLeave={() => setScrubbing(false)}
+            onMouseUp={endScrub}
+            onMouseLeave={endScrub}
             onTouchStart={(e) => { setScrubbing(true); seekFromEvent(e); }}
             onTouchMove={(e) => seekFromEvent(e)}
-            onTouchEnd={() => setScrubbing(false)}
+            onTouchEnd={endScrub}
             style={{ padding: "12px 0 8px", cursor: "pointer", touchAction: "none" }}
           >
             <div style={{ position: "relative", height: 4, background: "rgba(255,255,255,.22)", borderRadius: 3 }}>
@@ -708,7 +1149,7 @@ function Player({ item, onClose, onNext }) {
 
             <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: isMobile ? 2 : 6 }}>
               {onNext && (
-                <button className="mf-btn" onClick={onNext}
+                <button className="mf-btn" onClick={() => onNext()}
                   style={{ background: "rgba(255,255,255,.15)", color: "#f5efe9", border: "none", padding: isMobile ? "8px 12px" : "9px 16px", borderRadius: 6, fontSize: isMobile ? 12 : 14, fontWeight: 600, whiteSpace: "nowrap" }}>
                   Next
                 </button>

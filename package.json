@@ -7,12 +7,14 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "sync": "node server/sync-server.js"
   },
   "dependencies": {
     "lucide-react": "^1.25.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
